@@ -10,3 +10,10 @@ class StartInterviewResponse(Schema):
 class ReportResponse(Schema):
     final_report = fields.Dict()
     coaching_notes = fields.Dict()
+
+class ModelSelectionRequest(Schema):
+    model = fields.Str(required=True)
+
+class ModelSelectionResponse(Schema):
+    model = fields.Str()
+    available_models = fields.List(fields.Str())

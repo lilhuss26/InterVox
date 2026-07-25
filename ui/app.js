@@ -6,6 +6,7 @@ const els = {
   resumeInput: document.getElementById("resumeInput"),
   jobDescriptionInput: document.getElementById("jobDescriptionInput"),
   numQuestionsInput: document.getElementById("numQuestionsInput"),
+  modelSelect: document.getElementById("modelSelect"),
   startButton: document.getElementById("startButton"),
   connectionStatus: document.getElementById("connectionStatus"),
   sessionLabel: document.getElementById("sessionLabel"),
@@ -60,7 +61,39 @@ function log(...args) {
 }
 
 els.startForm.addEventListener("submit", startInterview);
+els.modelSelect.addEventListener("change", selectModel);
 els.questionAudio.addEventListener("ended", beginLiveAnswerCapture);
+
+loadSelectedModel();
+
+async function loadSelectedModel() {
+  try {
+    const response = await fetch("/api/interview/model");
+    const payload = await response.json();
+    if (response.ok && payload.model) {
+      els.modelSelect.value = payload.model;
+    }
+  } catch (error) {
+    log("failed to load model selection:", error.message);
+  }
+}
+
+async function selectModel() {
+  const model = els.modelSelect.value;
+  try {
+    const response = await fetch("/api/interview/model", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model }),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "Failed to switch model.");
+    }
+  } catch (error) {
+    showError(error.message);
+  }
+}
 els.questionAudio.addEventListener("play", () => {
   if (!isCapturing) {
     setLiveState("Question playing", "Listen to the full question. I will start listening when it ends.", "idle");

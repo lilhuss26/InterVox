@@ -1,7 +1,7 @@
 import pdfplumber
 import uuid
 from agent.Supervisor.Supervisor import Supervisor
-from agent.config.llm import haiku
+from src.api.model_store import get_selected_model
 from src.api.session_store import session_store
 
 
@@ -11,7 +11,7 @@ def start_interview(pdf_file, job_description: str, num_questions: int = 5) -> d
         resume = "\n".join(page.extract_text() for page in pdf.pages)
 
     # build the graph
-    supervisor = Supervisor(llm=haiku)
+    supervisor = Supervisor(llm=get_selected_model())
     graph = supervisor.build()
     session_id = str(uuid.uuid4())
     config = {"configurable": {"thread_id": session_id}}

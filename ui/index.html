@@ -53,6 +53,14 @@
                 <input id="numQuestionsInput" name="num_questions" type="number" min="3" max="15" value="5" required>
               </label>
 
+              <label class="field">
+                <span>AI Model</span>
+                <select id="modelSelect" name="model">
+                  <option value="haiku">Haiku</option>
+                  <option value="sonnet">Sonnet 3.5</option>
+                </select>
+              </label>
+
               <button class="primary" id="startButton" type="submit">Start live interview</button>
               <p class="hint">Your browser will ask for microphone access before the live session begins.</p>
             </form>

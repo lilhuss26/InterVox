@@ -1,7 +1,13 @@
 import pytest
 from marshmallow import ValidationError
 
-from src.api.DTOs import InterviewStartRequest, ReportResponse, StartInterviewResponse
+from src.api.DTOs import (
+    InterviewStartRequest,
+    ModelSelectionRequest,
+    ModelSelectionResponse,
+    ReportResponse,
+    StartInterviewResponse,
+)
 
 
 def test_start_request_requires_job_description():
@@ -24,3 +30,16 @@ def test_report_response_dump():
         {"final_report": {"score": 8}, "coaching_notes": {"tip": "x"}, "extra": 1}
     )
     assert dumped == {"final_report": {"score": 8}, "coaching_notes": {"tip": "x"}}
+
+
+def test_model_selection_request_requires_model():
+    with pytest.raises(ValidationError) as exc:
+        ModelSelectionRequest().load({})
+    assert "model" in exc.value.messages
+
+
+def test_model_selection_response_dump():
+    dumped = ModelSelectionResponse().dump(
+        {"model": "sonnet", "available_models": ["haiku", "sonnet"], "extra": 1}
+    )
+    assert dumped == {"model": "sonnet", "available_models": ["haiku", "sonnet"]}
