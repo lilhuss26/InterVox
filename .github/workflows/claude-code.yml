@@ -121,7 +121,7 @@ jobs:
                    * the `auto-pr` label applied.
           claude_args: |
             --model claude-sonnet-5
-            --max-turns 30
+            --max-turns 55
             --allowedTools "Read,Edit,Write,Glob,Grep,Bash(git:*),Bash(gh:*),Bash(pytest:*),Bash(pip install:*),Bash(ls:*),Bash(cat:*),Bash(grep:*),Bash(rg:*),Bash(find:*),Bash(head:*),Bash(tail:*)"
 
       # Distill the run into a compact JSON. if: always() so a failed or
