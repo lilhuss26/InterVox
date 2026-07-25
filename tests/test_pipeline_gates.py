@@ -294,9 +294,24 @@ def test_stale_claim_adopts_existing_issue(
     assert db.get_claim("m1", pipeline_settings)["issue_number"] == 99
 
 
-def test_history_id_not_advanced_when_issue_creation_fails(
+def _event_stages(settings, message_id=None):
+    """Read the events table for assertions on what the bridge recorded."""
+    with db.connect(settings) as conn:
+        if message_id is None:
+            rows = conn.execute("SELECT stage FROM events").fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT stage FROM events WHERE message_id = ?", (message_id,)
+            ).fetchall()
+    return [r["stage"] for r in rows]
+
+
+def test_failing_message_is_dropped_and_cursor_advances(
     fake_gmail, fake_repo, fake_llm, pipeline_settings, make_raw_message
 ):
+    # A message that cannot be turned into an issue (here GitHub is down) must be
+    # dropped and logged, NOT allowed to wedge the batch. Advancing the cursor is
+    # what stops Pub/Sub from replaying the same poisoned message forever.
     msg = make_raw_message()
     page = {"history": [{"messagesAdded": [{"message": {"id": "m1"}}]}]}
     gmail = fake_gmail(history_pages=[page], messages={"m1": msg})
@@ -310,11 +325,61 @@ def test_history_id_not_advanced_when_issue_creation_fails(
     )
     db.set_last_history_id(1, pipeline_settings)
 
-    with pytest.raises(RuntimeError):
-        bridge.handle_notification(50)
+    # No raise: the failure is isolated.
+    assert bridge.handle_notification(50) == []
+    assert repo.created == []
+    # Cursor advances so the batch does not replay.
+    assert db.get_last_history_id(pipeline_settings) == 50
+    # The drop is auditable.
+    assert "process_error" in _event_stages(pipeline_settings, "m1")
 
-    # The cursor must not move, so the batch replays rather than vanishing.
-    assert db.get_last_history_id(pipeline_settings) == 1
+
+def test_one_bad_message_does_not_block_siblings(
+    fake_gmail, fake_repo, fake_llm, pipeline_settings, make_raw_message
+):
+    # m1 fails classification (LLM raises), m2 succeeds. m2 must still become an
+    # issue, m1 is dropped, and the cursor advances past both.
+    m1 = make_raw_message(mid="m1")
+    m2 = make_raw_message(mid="m2", subject="[TASK] Second thing")
+    page = {
+        "history": [
+            {"messagesAdded": [{"message": {"id": "m1"}}]},
+            {"messagesAdded": [{"message": {"id": "m2"}}]},
+        ]
+    }
+    gmail = fake_gmail(history_pages=[page], messages={"m1": m1, "m2": m2})
+    repo = fake_repo()
+
+    # FakeLLM raises for the first invoke, succeeds for the second.
+    class FlakyLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def with_structured_output(self, schema, **kwargs):
+            return self
+
+        def invoke(self, messages):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("insufficient credits")
+            return classification()
+
+    bridge = Bridge(
+        gmail=gmail,
+        github_repo=repo,
+        llm=FlakyLLM(),
+        settings=pipeline_settings,
+        known_projects=[REPO],
+    )
+    db.set_last_history_id(1, pipeline_settings)
+
+    created = bridge.handle_notification(50)
+
+    assert len(repo.created) == 1
+    assert created == [repo.created[0].number]
+    assert db.get_last_history_id(pipeline_settings) == 50
+    assert "process_error" in _event_stages(pipeline_settings, "m1")
+    assert "process_error" not in _event_stages(pipeline_settings, "m2")
 
 
 # -- history handling ------------------------------------------------------
@@ -418,3 +483,79 @@ def test_expired_history_cursor_skips_ahead(
     assert repo.created == []
     # Skipped ahead deliberately; the gap is NOT backfilled.
     assert db.get_last_history_id(pipeline_settings) == 50
+
+
+# -- watch registration resilience -----------------------------------------
+
+
+class _FakeScheduler:
+    """Records add_job/remove_job; mirrors the hand-rolled-double style."""
+
+    def __init__(self, running=False):
+        self.running = running
+        self.started = False
+        self.jobs = {}          # id -> func
+        self.removed = []
+
+    def start(self):
+        self.started = True
+        self.running = True
+
+    def add_job(self, func, trigger=None, **kwargs):
+        self.jobs[kwargs.get("id")] = func
+
+    def remove_job(self, job_id):
+        self.removed.append(job_id)
+        self.jobs.pop(job_id, None)
+
+
+def test_register_watch_boot_failure_is_non_fatal(monkeypatch, pipeline_settings):
+    from pipeline import watch
+
+    def boom(**kwargs):
+        raise RuntimeError("gmail 429")
+
+    monkeypatch.setattr(watch, "start_watch", boom)
+    scheduler = _FakeScheduler()
+
+    # Must not raise even though registration fails.
+    watch.register_watch(scheduler=scheduler, settings=pipeline_settings)
+
+    # A background retry job was scheduled.
+    assert watch.BOOT_RETRY_JOB_ID in scheduler.jobs
+    assert scheduler.running
+
+
+def test_register_watch_retry_cancels_on_success(monkeypatch, pipeline_settings):
+    from pipeline import watch
+
+    calls = {"n": 0}
+
+    def flaky(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("gmail 429")  # boot attempt fails
+        # second attempt (the retry) succeeds
+
+    monkeypatch.setattr(watch, "start_watch", flaky)
+    scheduler = _FakeScheduler()
+
+    watch.register_watch(scheduler=scheduler, settings=pipeline_settings)
+    retry = scheduler.jobs[watch.BOOT_RETRY_JOB_ID]
+
+    # Fire the retry: it succeeds and cancels itself.
+    retry()
+    assert watch.BOOT_RETRY_JOB_ID in scheduler.removed
+    assert calls["n"] == 2
+
+
+def test_register_watch_success_schedules_no_retry(monkeypatch, pipeline_settings):
+    from pipeline import watch
+
+    monkeypatch.setattr(watch, "start_watch", lambda **kwargs: None)
+    scheduler = _FakeScheduler()
+
+    watch.register_watch(scheduler=scheduler, settings=pipeline_settings)
+
+    # Clean boot: no boot-retry job.
+    assert watch.BOOT_RETRY_JOB_ID not in scheduler.jobs

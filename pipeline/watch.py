@@ -15,6 +15,8 @@ from pipeline.storage import db
 log = logging.getLogger(__name__)
 
 WATCH_JOB_ID = "gmail_watch"
+BOOT_RETRY_JOB_ID = "gmail_watch_boot_retry"
+BOOT_RETRY_MINUTES = 5
 
 
 def start_watch(service=None, settings=None) -> int:
@@ -42,6 +44,51 @@ def start_watch(service=None, settings=None) -> int:
         log.info("seeded history cursor at %s", history_id)
     log.info("watch registered, expires %s", response.get("expiration"))
     return history_id
+
+
+def register_watch(scheduler=None, settings=None) -> BackgroundScheduler:
+    """Register the watch now; on failure, retry in the background. Never raises.
+
+    Registration is a network call to Gmail (users.watch), and Gmail rate-limits
+    it: a 429 on boot used to propagate out of the FastAPI lifespan, kill uvicorn,
+    and send the container into a restart loop that re-hit the same limit every
+    few seconds. Here a boot-time failure is only logged; a short-interval job
+    keeps retrying until it succeeds, then cancels itself. The daily renewal
+    (schedule_watch_renewal) is a separate, longer safety net.
+    """
+    settings = settings or get_settings()
+    scheduler = scheduler or BackgroundScheduler()
+    if not scheduler.running:
+        scheduler.start()
+
+    try:
+        start_watch(settings=settings)
+        return scheduler
+    except Exception:
+        log.warning(
+            "initial gmail watch failed; retrying every %d min",
+            BOOT_RETRY_MINUTES,
+            exc_info=True,
+        )
+
+    def _retry():
+        try:
+            start_watch(settings=settings)
+        except Exception:
+            log.warning("gmail watch retry failed; will keep trying", exc_info=True)
+            return
+        log.info("gmail watch registered on retry")
+        scheduler.remove_job(BOOT_RETRY_JOB_ID)
+
+    scheduler.add_job(
+        _retry,
+        "interval",
+        minutes=BOOT_RETRY_MINUTES,
+        id=BOOT_RETRY_JOB_ID,
+        replace_existing=True,
+        max_instances=1,
+    )
+    return scheduler
 
 
 def schedule_watch_renewal(scheduler=None, settings=None) -> BackgroundScheduler:

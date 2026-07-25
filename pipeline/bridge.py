@@ -39,10 +39,15 @@ class Bridge:
 
     # -- history ---------------------------------------------------------
 
-    def fetch_new_messages(self, start_history_id: int) -> list[dict]:
-        """Every messageAdded since the cursor, fully fetched.
+    def _list_new_message_ids(self, start_history_id: int) -> list[str]:
+        """Every messageAdded id since the cursor, first-seen order.
 
-        Returns [] and resets the cursor if Gmail has aged the cursor out.
+        Returns [] and resets the cursor if Gmail has aged the cursor out. A
+        non-404 HttpError propagates: it is a batch-level, genuinely transient
+        failure (rate limit, 5xx) with nothing to skip, so letting the webhook
+        500 and Pub/Sub retry is the right behaviour. Per-message fetching is
+        deliberately NOT done here — the caller fetches each id in isolation so
+        one bad message cannot abort the whole batch.
         """
         try:
             request = (
@@ -73,13 +78,16 @@ class Bridge:
                 return []
             raise
 
-        return [
+        return message_ids
+
+    def _fetch_message(self, message_id: str) -> dict:
+        """Fully fetch one message by id."""
+        return (
             self.gmail.users()
             .messages()
-            .get(userId="me", id=mid, format="full")
+            .get(userId="me", id=message_id, format="full")
             .execute()
-            for mid in message_ids
-        ]
+        )
 
     def _recover_expired_cursor(self) -> None:
         """Gmail keeps history ~1 week; past that startHistoryId 404s.
@@ -158,13 +166,25 @@ class Bridge:
             return []
 
         created = []
-        for raw in self.fetch_new_messages(start):
-            number = self.process_message(raw, correlation_id)
-            if number is not None:
-                created.append(number)
+        for mid in self._list_new_message_ids(start):
+            # Isolate each message: a failure in fetch/classify/create (e.g. the
+            # LLM when Anthropic credits run out) is logged and the message
+            # dropped, rather than raised. Raising here would 500 the webhook and
+            # — because the cursor only advanced on full success — make Pub/Sub
+            # replay the same poisoned message forever.
+            try:
+                raw = self._fetch_message(mid)
+                number = self.process_message(raw, correlation_id)
+                if number is not None:
+                    created.append(number)
+            except Exception:
+                log.exception("dropping message %s after processing failure", mid)
+                self.db.log_event(
+                    correlation_id, "process_error", mid, settings=self.settings
+                )
 
-        # Advance only after every message reached a terminal state. If any of
-        # them raised we never get here, so the batch replays next time.
+        # Always advance: a message that cannot be processed is dropped (logged
+        # as process_error above), never allowed to wedge the batch.
         self.db.set_last_history_id(history_id, self.settings)
         return created
 

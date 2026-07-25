@@ -47,11 +47,15 @@ async def lifespan(app: FastAPI):
 
     if settings.autowatch:
         # Behind a flag so importing this module in a test never calls Google.
-        from pipeline.watch import schedule_watch_renewal, start_watch
+        from pipeline.watch import register_watch, schedule_watch_renewal
 
-        start_watch(settings=settings)
-        schedule_watch_renewal(settings=settings)
-        log.info("gmail watch registered; renewing daily")
+        # register_watch never raises: a Gmail 429 on boot must not crash the
+        # container (that turned into a restart loop that kept hitting the limit).
+        # It logs and retries in the background; the daily renewal shares the
+        # same scheduler.
+        scheduler = schedule_watch_renewal(settings=settings)
+        register_watch(scheduler=scheduler, settings=settings)
+        log.info("gmail watch registration attempted; renewing daily")
     else:
         log.info("autowatch off — set PIPELINE_AUTOWATCH=1 to register the watch")
 
