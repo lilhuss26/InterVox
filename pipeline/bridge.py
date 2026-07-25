@@ -109,6 +109,15 @@ class Bridge:
         message_id = parsed["message_id"]
 
         def drop(stage: str) -> None:
+            # The message is already terminal (or about to be marked so by the
+            # caller); just record the event.
+            self.db.log_event(correlation_id, stage, message_id, settings=self.settings)
+
+        def reject(stage: str) -> None:
+            # A terminal decision that produced no issue. Mark it dropped so a
+            # later overlapping history window skips it instead of re-fetching,
+            # re-scanning GitHub, and re-deciding it every time.
+            self.db.mark_dropped(message_id, self.settings)
             self.db.log_event(correlation_id, stage, message_id, settings=self.settings)
 
         if not self.db.claim_message(message_id, self.settings):
@@ -128,16 +137,16 @@ class Bridge:
             log.warning("stale claim for %s with no issue; recreating", message_id)
 
         if not passes_allowlist(parsed["sender"], self.settings.allowlist):
-            drop("reject_allowlist")
+            reject("reject_allowlist")
             return None
 
         if not passes_subject_prefix(parsed["subject"]):
-            drop("reject_subject")
+            reject("reject_subject")
             return None
 
         result = classify_email(self.llm, parsed, self.known_projects)
         if result.project not in self.known_projects or not result.actionable:
-            drop("reject_llm")
+            reject("reject_llm")
             return None
 
         body = github_client.build_issue_body(
@@ -167,6 +176,14 @@ class Bridge:
 
         created = []
         for mid in self._list_new_message_ids(start):
+            # Overlapping history windows re-list the same ids; a message with a
+            # non-NULL issue_number is already terminal (issue created, rejected,
+            # or dropped), so skip it before paying a format=full fetch and a
+            # GitHub rescan. Only NULL (mid-flight) or unseen ids fall through.
+            claim = self.db.get_claim(mid, self.settings)
+            if claim is not None and claim["issue_number"] is not None:
+                continue
+
             # Isolate each message: a failure in fetch/classify/create (e.g. the
             # LLM when Anthropic credits run out) is logged and the message
             # dropped, rather than raised. Raising here would 500 the webhook and
@@ -177,14 +194,30 @@ class Bridge:
                 number = self.process_message(raw, correlation_id)
                 if number is not None:
                     created.append(number)
+            except HttpError as exc:
+                if getattr(exc.resp, "status", None) == 404:
+                    # Deleted before we read it — expected and terminal, not an
+                    # error. One calm line, mark it gone, never retry.
+                    log.info("message %s no longer exists; skipping", mid)
+                    self.db.mark_dropped(mid, self.settings)
+                    self.db.log_event(
+                        correlation_id, "message_gone", mid, settings=self.settings
+                    )
+                else:
+                    log.exception("dropping message %s after fetch failure", mid)
+                    self.db.mark_dropped(mid, self.settings)
+                    self.db.log_event(
+                        correlation_id, "process_error", mid, settings=self.settings
+                    )
             except Exception:
                 log.exception("dropping message %s after processing failure", mid)
+                self.db.mark_dropped(mid, self.settings)
                 self.db.log_event(
                     correlation_id, "process_error", mid, settings=self.settings
                 )
 
-        # Always advance: a message that cannot be processed is dropped (logged
-        # as process_error above), never allowed to wedge the batch.
+        # Always advance: a message that cannot be processed is dropped (marked
+        # terminal above), never allowed to wedge the batch.
         self.db.set_last_history_id(history_id, self.settings)
         return created
 

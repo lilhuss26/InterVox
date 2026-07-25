@@ -2,6 +2,15 @@
 
 A fresh connection per operation, not a shared module-level one: the webhook
 runs on a threadpool and SQLite objects are not portable across threads.
+
+processed_messages.issue_number carries a three-way convention:
+    NULL  -> claimed, still in flight (may have died mid-run; recoverable)
+    0     -> DROPPED: terminally seen but not an issue (gate/LLM reject, a
+             deleted message, or a failed one) — never reprocess it
+    >= 1  -> the number of the issue this message opened
+Overlapping Gmail history windows re-list the same ids repeatedly, so a durable
+terminal marker is what lets the bridge skip a decided message with one indexed
+lookup instead of re-fetching and re-scanning GitHub every time.
 """
 
 import os
@@ -12,6 +21,10 @@ from datetime import datetime, timezone
 from pipeline.config import get_settings
 
 _LAST_HISTORY_ID = "last_history_id"
+
+# Sentinel issue_number for a message that is terminally decided but produced no
+# issue. GitHub issue numbers start at 1, so 0 can never collide with a real one.
+DROPPED = 0
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS processed_messages (
@@ -159,6 +172,17 @@ def mark_processed(message_id: str, issue_number: int | None = None, settings=No
             "processed_at = excluded.processed_at, issue_number = excluded.issue_number",
             (message_id, _now(), issue_number),
         )
+
+
+def mark_dropped(message_id: str, settings=None) -> None:
+    """Terminally mark a message as seen-but-not-an-issue.
+
+    Used for gate/LLM rejects and for messages we cannot fetch or process (e.g. a
+    deleted message that 404s). Writes the DROPPED sentinel so it is distinct from
+    a claimed-but-pending row (NULL issue_number), which keeps overlapping history
+    windows from re-fetching and re-scanning it forever.
+    """
+    mark_processed(message_id, DROPPED, settings)
 
 
 def log_event(

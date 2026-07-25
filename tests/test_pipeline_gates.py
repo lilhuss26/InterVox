@@ -485,6 +485,96 @@ def test_expired_history_cursor_skips_ahead(
     assert db.get_last_history_id(pipeline_settings) == 50
 
 
+# -- terminal dedup across overlapping windows -----------------------------
+
+
+def test_rejected_message_is_terminal_and_not_refetched(
+    fake_gmail, fake_repo, fake_llm, pipeline_settings, make_raw_message
+):
+    # Ordinary (non-[TASK]) mail must be decided once, then skipped without a
+    # re-fetch or GitHub rescan on every overlapping history window.
+    msg = make_raw_message(subject="just a normal email")
+    page = {"history": [{"messagesAdded": [{"message": {"id": "m1"}}]}]}
+    gmail = fake_gmail(history_pages=[page], messages={"m1": msg})
+    repo = fake_repo()
+    bridge = Bridge(
+        gmail=gmail,
+        github_repo=repo,
+        llm=fake_llm({TaskClassification: classification()}),
+        settings=pipeline_settings,
+        known_projects=[REPO],
+    )
+    db.set_last_history_id(1, pipeline_settings)
+
+    bridge.handle_notification(50)   # first window: fetch, reject, mark terminal
+    bridge.handle_notification(60)   # second, overlapping window: must skip
+
+    assert repo.created == []
+    assert len([c for c in gmail.calls if c[0] == "messages.get"]) == 1
+    assert db.get_claim("m1", pipeline_settings)["issue_number"] == db.DROPPED
+
+
+def test_deleted_message_404_is_gone_not_error(
+    fake_gmail, fake_repo, fake_llm, pipeline_settings
+):
+    # A message deleted before we read it 404s on fetch. That is expected and
+    # terminal — recorded as message_gone (not process_error), and never
+    # re-fetched afterwards.
+    from googleapiclient.errors import HttpError
+
+    class Resp404:
+        status = 404
+        reason = "Not Found"
+
+    page = {"history": [{"messagesAdded": [{"message": {"id": "m1"}}]}]}
+    gmail = fake_gmail(
+        history_pages=[page], messages={"m1": HttpError(Resp404(), b"gone")}
+    )
+    repo = fake_repo()
+    bridge = Bridge(
+        gmail=gmail,
+        github_repo=repo,
+        llm=fake_llm({TaskClassification: classification()}),
+        settings=pipeline_settings,
+        known_projects=[REPO],
+    )
+    db.set_last_history_id(1, pipeline_settings)
+
+    bridge.handle_notification(50)
+    stages = _event_stages(pipeline_settings, "m1")
+    assert "message_gone" in stages
+    assert "process_error" not in stages
+    assert db.get_claim("m1", pipeline_settings)["issue_number"] == db.DROPPED
+
+    bridge.handle_notification(60)   # skipped, no re-fetch
+    assert len([c for c in gmail.calls if c[0] == "messages.get"]) == 1
+
+
+def test_created_issue_message_not_refetched_on_overlap(
+    fake_gmail, fake_repo, fake_llm, pipeline_settings, make_raw_message
+):
+    # A message that already opened an issue must not be re-fetched when a later
+    # window re-lists it (it is terminal with a real issue number).
+    msg = make_raw_message()
+    page = {"history": [{"messagesAdded": [{"message": {"id": "m1"}}]}]}
+    gmail = fake_gmail(history_pages=[page], messages={"m1": msg})
+    repo = fake_repo()
+    bridge = Bridge(
+        gmail=gmail,
+        github_repo=repo,
+        llm=fake_llm({TaskClassification: classification()}),
+        settings=pipeline_settings,
+        known_projects=[REPO],
+    )
+    db.set_last_history_id(1, pipeline_settings)
+
+    bridge.handle_notification(50)
+    bridge.handle_notification(60)
+
+    assert len(repo.created) == 1
+    assert len([c for c in gmail.calls if c[0] == "messages.get"]) == 1
+
+
 # -- watch registration resilience -----------------------------------------
 
 
