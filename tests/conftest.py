@@ -143,6 +143,18 @@ def clean_session_store():
     session_store.clear()
 
 
+@pytest.fixture(autouse=True)
+def reset_model_selection():
+    # model_store tracks the selected model in a module-level dict, so a
+    # switch in one test would otherwise leak into the next.
+    from agent.config.llm import DEFAULT_MODEL
+    from src.api.model_store import set_selected_model_name
+
+    set_selected_model_name(DEFAULT_MODEL)
+    yield
+    set_selected_model_name(DEFAULT_MODEL)
+
+
 # --------------------------------------------------------------------------
 # Pipeline (email -> GitHub issue) doubles.
 #
