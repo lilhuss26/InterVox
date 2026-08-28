@@ -63,3 +63,9 @@ def test_report_404_unknown_session(client):
     resp = client.get("/api/interview/does-not-exist/report")
     assert resp.status_code == 404
     assert resp.get_json() == {"error": "session not found"}
+
+
+def test_ping(client):
+    resp = client.get("/ping")
+    assert resp.status_code == 200
+    assert resp.get_json() == {"pong": True}
